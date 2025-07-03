@@ -1,0 +1,30 @@
+[project]
+name = "orchestrator"
+version = "0.1.0"
+description = "dagster orchestrator for em workflow"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "azure-storage-blob>=12.25.1",
+    "croniter>=6.0.0",
+    "dagster>=1.11.0",
+    "dagster-webserver>=1.11.0",
+    "python-dateutil>=2.9.0.post0",
+    "requests>=2.32.4",
+    "pytest>=8.0.0",
+    "requests-mock>=1.12.0",
+]
+
+
+[tool.dagster]
+module_name = "orchestrator"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+markers = [
+    "integration: marks tests as integration tests (may require external services)"
+]
+addopts = "-v --tb=short"
