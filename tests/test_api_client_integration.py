@@ -21,7 +21,7 @@ class TestDjangoAPIClientIntegration:
     @pytest.fixture  
     def staging_client(self):
         """Client configured for staging environment"""
-        staging_url = os.getenv("DJANGO_STAGING_API_URL", "https://staging-api.yourcompany.com")
+        staging_url = os.getenv("DJANGO_STAGING_API_URL")
         staging_token = os.getenv("DJANGO_STAGING_JWT_TOKEN")
         
         if not staging_token:

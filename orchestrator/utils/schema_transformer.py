@@ -24,8 +24,9 @@ def transform_report_schema(api_response: Dict[str, Any]) -> Dict[str, Any]:
 
     # Check that there's only one type of event
     if len(event_types) > 1:
-        raise ValueError(f"Multiple event types found: {event_types}. Expected only one type.")
-    
+        raise ValueError(f"Multiple event types found: {
+                         event_types}. Expected only one type.")
+
     # Determine the events key name based on event type
     events_key = "events"  # default
     if len(event_types) == 1:
@@ -41,13 +42,13 @@ def transform_report_schema(api_response: Dict[str, Any]) -> Dict[str, Any]:
 
     # Create transformed structure
     transformed = {
-        "report": {
-            **report,
-            # Add all modifier keys to the top level report
-            **modifiers,
-            # Add events to report with appropriate key name
+         {
+            **{k: v for k, v in report.items() if k not in ['cron', 'id']},
+            **{'as_at_date': modifiers['as_at_date'],
+                   'fx_date': modifiers['fx_date']},
+
             events_key: events,
-        },
+
     }
 
     # Preserve metadata if it exists

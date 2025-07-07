@@ -2,7 +2,7 @@ from dagster import asset, AssetIn, Config, get_dagster_logger, OpExecutionConte
 from ..resources.api_client import DjangoAPIClient
 from ..resources.azure_storage import AzureStorageResource
 from ..utils.schema_transformer import transform_report_schema
-from ..utils.external_api import ExternalAPIClient
+from ..utils.external_api import FireantAPIClient as ExternalAPIClient
 from typing import Dict, Any
 import time
 import json

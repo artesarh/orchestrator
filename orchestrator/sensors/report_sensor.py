@@ -86,7 +86,7 @@ def report_cron_sensor(context: SensorEvaluationContext):
                                     "config": {
                                         "report_id": int(report_id),
                                         "modifier_id": 1,  # You'll need logic to determine this
-                                                                "external_api_url": EXTERNAL_API_URL,
+                                        "external_api_url": EXTERNAL_API_URL,
                                         "external_api_key": EXTERNAL_API_KEY,
                                     }
                                 }

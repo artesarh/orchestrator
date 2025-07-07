@@ -12,8 +12,10 @@ from .sensors.report_sensor import report_cron_sensor, daily_report_discovery_se
 from .resources.api_client import DjangoAPIClient
 from .resources.azure_storage import AzureStorageResource
 from .utils.config import (
-    DJANGO_API_URL, DJANGO_JWT_TOKEN, 
-    AZURE_CONNECTION_STRING, AZURE_CONTAINER_NAME
+    DJANGO_API_URL,
+    DJANGO_JWT_TOKEN,
+    AZURE_CONNECTION_STRING,
+    AZURE_CONTAINER_NAME
 )
 
 defs = Definitions(

@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional
 import time
 
 
-class ExternalAPIClient:
+class FireantAPIClient:
     def __init__(self, base_url: str, api_key: str):
         self.base_url = base_url
         self.api_key = api_key
@@ -23,7 +23,9 @@ class ExternalAPIClient:
         """Check job status on external service"""
         headers = {"Authorization": f"Bearer {self.api_key}"}
         response = requests.get(
-            f"{self.base_url}/jobs/{job_id}/status", headers=headers
+            f"{self.base_url}/jobs/{job_id}/status",
+            headers=headers,
+            # TODO: Set the get_results=False field
         )
         response.raise_for_status()
         return response.json()

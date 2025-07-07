@@ -26,7 +26,14 @@ ENV/
 
 # Environment variables
 .env
+.env.dev
+.env.test
+.env.prod
+.env.local
 
 # Dagster
 dagster_home/
 logs/
+
+
+vault_pass.txt

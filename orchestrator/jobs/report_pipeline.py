@@ -16,6 +16,7 @@ from ..assets.report_processing import (
 )
 from ..assets.report_discovery import report_cron_schedules
 
+
 # Dynamic partitions for reports
 report_partitions = DynamicPartitionsDefinition(name="reports")
 
