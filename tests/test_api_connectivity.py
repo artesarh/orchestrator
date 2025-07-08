@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Quick connectivity test for Django API
-Tests the /api endpoint to verify server is running and accessible
+Enhanced connectivity test for Django API
+Tests all major endpoints to verify server functionality
 """
 
 import requests
 import sys
 import os
+import json
 from pathlib import Path
-from orchestrator.utils.config import DJANGO_API_URL, get_environment
+from orchestrator.utils.config import DJANGO_API_URL, get_env
+from orchestrator.resources.api_client import DjangoAPIClient
 
 
 def test_api_connectivity() -> bool:
@@ -89,15 +91,131 @@ def test_api_with_auth() -> bool:
         return False
 
 
+def test_django_api_endpoints() -> bool:
+    """Test all major Django API endpoints used by the orchestrator"""
+    try:
+        from orchestrator.utils.config import DJANGO_JWT_TOKEN
+        client = DjangoAPIClient(base_url=DJANGO_API_URL, api_token=DJANGO_JWT_TOKEN)
+    except ValueError as e:
+        print(f"⚠️  Skipping endpoint tests: {e}")
+        return False
+    
+    print(f"\nTesting Django API endpoints...")
+    
+    endpoints_tested = 0
+    endpoints_passed = 0
+    
+    # Test 1: GET /api/reports/
+    try:
+        print(f"  Testing GET /api/reports/")
+        response = client.get_all_reports()
+        if isinstance(response, dict) and "data" in response:
+            print(f"    ✅ SUCCESS: Found {len(response.get('data', []))} reports")
+            endpoints_passed += 1
+        else:
+            print(f"    ❌ FAILED: Unexpected response structure")
+        endpoints_tested += 1
+    except Exception as e:
+        print(f"    ❌ FAILED: {e}")
+        endpoints_tested += 1
+    
+    # Test 2: GET /api/reports/{id}/ (if any reports exist)
+    try:
+        reports_response = client.get_all_reports()
+        reports = reports_response.get("data", [])
+        if reports:
+            report_id = reports[0].get("id")
+            print(f"  Testing GET /api/reports/{report_id}/")
+            response = client.get_report(report_id)
+            if isinstance(response, dict) and "data" in response:
+                print(f"    ✅ SUCCESS: Retrieved report {report_id}")
+                endpoints_passed += 1
+            else:
+                print(f"    ❌ FAILED: Unexpected response structure")
+        else:
+            print(f"  ⚠️  SKIPPED: No reports available to test GET /api/reports/{id}/")
+        endpoints_tested += 1
+    except Exception as e:
+        print(f"    ❌ FAILED: {e}")
+        endpoints_tested += 1
+    
+    # Test 3: POST /api/jobs/ (create job)
+    try:
+        print(f"  Testing POST /api/jobs/")
+        test_job_data = {
+            "report_id": 1,
+            "report_modifier_id": 1,
+            "fireant_jobid": "test_job_" + str(int(time.time())),
+            "status": "submitted"
+        }
+        response = client.create_job(test_job_data)
+        if isinstance(response, dict) and "id" in response:
+            job_id = response["id"]
+            print(f"    ✅ SUCCESS: Created job {job_id}")
+            endpoints_passed += 1
+            
+            # Test 4: PATCH /api/jobs/{id}/ (update job)
+            try:
+                print(f"  Testing PATCH /api/jobs/{job_id}/")
+                update_data = {"status": "completed"}
+                response = client.update_job(job_id, update_data)
+                if isinstance(response, dict) and response.get("status") == "completed":
+                    print(f"    ✅ SUCCESS: Updated job {job_id}")
+                    endpoints_passed += 1
+                else:
+                    print(f"    ❌ FAILED: Job update unsuccessful")
+                endpoints_tested += 1
+                
+                # Clean up: DELETE the test job
+                try:
+                    client.delete_job(job_id)
+                    print(f"    ✅ CLEANUP: Deleted test job {job_id}")
+                except Exception as e:
+                    print(f"    ⚠️  CLEANUP WARNING: Could not delete test job {job_id}: {e}")
+                    
+            except Exception as e:
+                print(f"    ❌ FAILED: {e}")
+                endpoints_tested += 1
+        else:
+            print(f"    ❌ FAILED: Unexpected response structure")
+        endpoints_tested += 1
+    except Exception as e:
+        print(f"    ❌ FAILED: {e}")
+        endpoints_tested += 1
+    
+    # Test 5: GET /api/reports/{id}/modifiers/{modifier_id}/all (if data exists)
+    try:
+        reports_response = client.get_all_reports()
+        reports = reports_response.get("data", [])
+        if reports:
+            report_id = reports[0].get("id")
+            print(f"  Testing GET /api/reports/{report_id}/modifiers/1/all")
+            response = client.get_report_with_modifier(report_id, 1)
+            if isinstance(response, dict) and "data" in response:
+                print(f"    ✅ SUCCESS: Retrieved report with modifier")
+                endpoints_passed += 1
+            else:
+                print(f"    ❌ FAILED: Unexpected response structure")
+        else:
+            print(f"  ⚠️  SKIPPED: No reports available to test modifier endpoint")
+        endpoints_tested += 1
+    except Exception as e:
+        print(f"    ❌ FAILED: {e}")
+        endpoints_tested += 1
+    
+    print(f"\nEndpoint Test Summary: {endpoints_passed}/{endpoints_tested} passed")
+    return endpoints_passed == endpoints_tested
+
+
 def check_environment_setup():
     """Check if environment variables are properly configured"""
-    env = get_environment()
+    env = get_env()
     print("Environment Configuration Check:")
     print("-" * 40)
     print(f"Current environment: {env.value}")
     
     # Check which config files exist
-    root_dir = Path(__file__).parent
+    root_dir = Path(__file__).parent.parent
     config_files = {
         ".env": root_dir / ".env",
         f".env.{env.value}": root_dir / f".env.{env.value}",
@@ -117,17 +235,17 @@ def check_environment_setup():
     
     # Try to import sensitive config values and handle missing ones gracefully
     sensitive_checks = []
-    for var_name in ["DJANGO_JWT_TOKEN", "EXTERNAL_API_URL", "EXTERNAL_API_KEY"]:
+    for var_name in ["DJANGO_JWT_TOKEN", "FIREANT_API_URL", "FIREANT_API_KEY"]:
         try:
             if var_name == "DJANGO_JWT_TOKEN":
                 from orchestrator.utils.config import DJANGO_JWT_TOKEN
                 sensitive_checks.append((var_name, DJANGO_JWT_TOKEN, True))
-            elif var_name == "EXTERNAL_API_URL":
-                from orchestrator.utils.config import EXTERNAL_API_URL
-                sensitive_checks.append((var_name, EXTERNAL_API_URL, False))
-            elif var_name == "EXTERNAL_API_KEY":
-                from orchestrator.utils.config import EXTERNAL_API_KEY
-                sensitive_checks.append((var_name, EXTERNAL_API_KEY, True))
+            elif var_name == "FIREANT_API_URL":
+                from orchestrator.utils.config import FIREANT_API_URL
+                sensitive_checks.append((var_name, FIREANT_API_URL, False))
+            elif var_name == "FIREANT_API_KEY":
+                from orchestrator.utils.config import FIREANT_API_KEY
+                sensitive_checks.append((var_name, FIREANT_API_KEY, True))
         except ValueError:
             sensitive_checks.append((var_name, None, True))
     
@@ -161,6 +279,8 @@ def check_environment_setup():
 
 
 if __name__ == "__main__":
+    import time
+    
     print("Django API Connectivity Test")
     print("=" * 40)
     print(f"Target URL: {DJANGO_API_URL}")
@@ -178,9 +298,17 @@ if __name__ == "__main__":
     if basic_success:
         auth_success = test_api_with_auth()
     
+    # Test specific endpoints if auth passes
+    endpoint_success = False
+    if auth_success:
+        endpoint_success = test_django_api_endpoints()
+    
     print("\n" + "=" * 40)
-    if basic_success and auth_success:
-        print("✅ ALL TESTS PASSED - Django API is accessible and working")
+    if basic_success and auth_success and endpoint_success:
+        print("✅ ALL TESTS PASSED - Django API is fully functional")
+        sys.exit(0)
+    elif basic_success and auth_success:
+        print("⚠️  PARTIAL SUCCESS - Django API is accessible but some endpoints failed")
         sys.exit(0)
     elif basic_success:
         print("⚠️  PARTIAL SUCCESS - Django server is running")

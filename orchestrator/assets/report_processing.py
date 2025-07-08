@@ -1,20 +1,21 @@
 from dagster import asset, AssetIn, Config, get_dagster_logger, OpExecutionContext
 from ..resources.api_client import DjangoAPIClient
-from ..resources.azure_storage import AzureStorageResource
+from ..resources.external_api import FireantAPIClient
 from ..utils.schema_transformer import transform_report_schema
-from ..utils.external_api import FireantAPIClient as ExternalAPIClient
+from ..utils.config import MAX_POLL_ATTEMPTS, POLL_INTERVAL_SECONDS
 from typing import Dict, Any
+from datetime import date, datetime
 import time
 import json
+import requests
+from ..resources.fabric_storage import FabricStorageResource
 
 
 class ReportProcessingConfig(Config):
     report_id: int
-    modifier_id: int
-    external_api_url: str
-    external_api_key: str
-    max_poll_attempts: int = 120  # 2 hours with 1-minute intervals
-    poll_interval_seconds: int = 60
+    run_date: str  # Changed from modifier_id to run_date
+    fireant_api_url: str
+    fireant_api_key: str
 
 
 @asset(group_name="processing", compute_kind="api_call")
@@ -26,15 +27,50 @@ def report_data(
     """Fetch and transform report data from Django API"""
     logger = get_dagster_logger()
 
-    # Get raw data from API
-    raw_data = api_client.get_report_with_modifier(
-        config.report_id, config.modifier_id)
+    # 1. Get report and validate it has event group
+    try:
+        report_response = api_client.get_report(config.report_id)
+        report = report_response.get("data", {})
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            raise ValueError(f"Report {config.report_id} not found")
+        raise
 
-    # Transform schema
-    transformed_data = transform_report_schema(raw_data)
+    if not report.get("event_group"):
+        error_msg = (
+            f"Report {config.report_id} ('{report.get('name', 'Unknown')}') has no Event Group associated. "
+            "Cannot process report without an event group. Please assign an event group in the Django admin."
+        )
+        context.add_output_metadata({
+            "error": error_msg,
+            "report_id": config.report_id,
+            "report_name": report.get("name", "Unknown"),
+            "event_group_status": "MISSING - USER ACTION REQUIRED",
+        })
+        raise ValueError(error_msg)
 
-    logger.info(f"Retrieved and transformed data for report {
-                config.report_id}")
+    # 2. Get or create modifier for the run date
+    run_date = date.fromisoformat(config.run_date)
+    modifier = api_client.get_or_create_modifier_for_date(config.report_id, run_date)
+    modifier_id = modifier["id"]
+
+    # 3. Get and transform report data
+    raw_data = api_client.get_report_with_modifier(config.report_id, modifier_id)
+    transformed_data, event_type = transform_report_schema(raw_data)
+
+    # Add metadata for downstream assets
+    context.add_output_metadata({
+        "event_type": event_type,
+        "report_id": config.report_id,
+        "modifier_id": modifier_id,
+        "report_name": report.get("name", "Unknown"),
+    })
+
+    logger.info(
+        f"Processed report {config.report_id} ({report.get('name', 'Unknown')}) "
+        f"with modifier {modifier_id} for {run_date}, event type: {event_type}"
+    )
+
     return transformed_data
 
 
@@ -44,23 +80,45 @@ def external_job_submission(
     config: ReportProcessingConfig,
     report_data: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Submit job to external API and get job ID"""
+    """Submit job to Fireant API and get job ID"""
     logger = get_dagster_logger()
 
-    external_client = ExternalAPIClient(
-        config.external_api_url, config.external_api_key
+    # Get metadata from upstream asset
+    upstream_output = context.asset_output_for_input("report_data")
+    if not upstream_output or not upstream_output.metadata:
+        raise ValueError("Missing metadata from report_data asset")
+
+    event_type = upstream_output.metadata.get("event_type")
+    report_name = upstream_output.metadata.get("report_name", "Unknown")
+    
+    if not event_type:
+        raise ValueError("Could not determine event type from report data")
+
+    logger.info(f"Submitting {event_type} job for report '{report_name}'")
+
+    fireant_client = FireantAPIClient(
+        config.fireant_api_url, config.fireant_api_key
     )
 
-    # Submit to external API
-    external_job_id = external_client.submit_job(report_data)
+    # Submit to Fireant API with job type
+    fireant_job_id = fireant_client.submit_job(report_data, event_type)
 
-    logger.info(f"Submitted job to external API, got job_id: {
-                external_job_id}")
+    logger.info(f"Submitted {event_type} job to Fireant API, got job_id: {fireant_job_id}")
+
+    # Add metadata for downstream assets
+    context.add_output_metadata({
+        "event_type": event_type,
+        "report_id": config.report_id,
+        "report_name": report_name,
+        "fireant_job_id": fireant_job_id,
+        "submission_time": datetime.now().isoformat(),
+    })
 
     return {
-        "external_job_id": external_job_id,
+        "fireant_job_id": fireant_job_id,
         "status": "submitted",
         "submitted_at": time.time(),
+        "job_type": event_type,
     }
 
 
@@ -74,16 +132,56 @@ def local_job_record(
     """Create job record in local Django database"""
     logger = get_dagster_logger()
 
+    # Get metadata from upstream assets
+    report_data_output = context.asset_output_for_input("report_data")
+    if not report_data_output or not report_data_output.metadata:
+        raise ValueError("Missing metadata from report_data asset")
+
+    job_output = context.asset_output_for_input("external_job_submission")
+    if not job_output or not job_output.metadata:
+        raise ValueError("Missing metadata from external_job_submission asset")
+
+    # Get required values from metadata
+    modifier_id = report_data_output.metadata.get("modifier_id")
+    report_name = report_data_output.metadata.get("report_name", "Unknown")
+    fireant_job_id = job_output.metadata.get("fireant_job_id")
+    event_type = job_output.metadata.get("event_type")
+
+    if not modifier_id:
+        raise ValueError("Missing modifier_id in metadata")
+    if not fireant_job_id:
+        raise ValueError("Missing fireant_job_id in metadata")
+
     job_data = {
-        "report": config.report_id,
-        "fireant_jobid": external_job_submission["external_job_id"],
-        "status": "submitted",  # Add this field to your Job model
+        "report_id": config.report_id,
+        "report_modifier_id": modifier_id,
+        "fireant_jobid": fireant_job_id,
+        "status": "submitted",
     }
 
     local_job = api_client.create_job(job_data)
-    logger.info(f"Created local job record: {local_job['id']}")
+    logger.info(
+        f"Created local job record {local_job['id']} for report '{report_name}' "
+        f"({event_type} job, modifier: {modifier_id})"
+    )
 
-    return {**local_job, "external_job_id": external_job_submission["external_job_id"]}
+    # Add metadata for downstream assets
+    context.add_output_metadata({
+        "local_job_id": local_job["id"],
+        "report_id": config.report_id,
+        "report_name": report_name,
+        "modifier_id": modifier_id,
+        "fireant_job_id": fireant_job_id,
+        "event_type": event_type,
+        "creation_time": datetime.now().isoformat(),
+    })
+
+    return {
+        **local_job,
+        "fireant_job_id": fireant_job_id,
+        "report_name": report_name,
+        "event_type": event_type,
+    }
 
 
 @asset(group_name="processing", compute_kind="polling", deps=[local_job_record])
@@ -93,43 +191,73 @@ def job_completion_status(
     api_client: DjangoAPIClient,
     local_job_record: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Poll external API until job is complete"""
+    """Poll Fireant API until job is complete"""
     logger = get_dagster_logger()
 
-    external_client = ExternalAPIClient(
-        config.external_api_url, config.external_api_key
+    fireant_client = FireantAPIClient(
+        config.fireant_api_url, config.fireant_api_key
     )
 
-    external_job_id = local_job_record["external_job_id"]
+    fireant_job_id = local_job_record["fireant_job_id"]
     local_job_id = local_job_record["id"]
+    report_name = local_job_record.get("report_name", "Unknown")
 
-    for attempt in range(config.max_poll_attempts):
-        status_response = external_client.check_job_status(external_job_id)
-        status = status_response.get("status")
+    # Map Fireant statuses to our local statuses
+    status_mapping = {
+        "Running": "running",
+        "Failed": "failed",
+        "Finished": "completed"
+    }
 
-        # Update local job status
-        api_client.update_job(local_job_id, {"status": status})
+    for attempt in range(MAX_POLL_ATTEMPTS):
+        status_response = fireant_client.check_job_status(fireant_job_id)
+        
+        # Get status from data/status in response
+        fireant_status = status_response.get("data", {}).get("status")
+        if not fireant_status:
+            logger.warning(
+                f"No status found in Fireant response for job {fireant_job_id}: {status_response}"
+            )
+            # Use raw response as fallback
+            fireant_status = status_response.get("status", "Unknown")
 
-        if status in ["completed", "failed", "error"]:
-            logger.info(
-                f"Job {external_job_id} finished with status: {status}")
+        # Map Fireant status to our status
+        local_status = status_mapping.get(fireant_status, "unknown")
+        
+        # Always update local job to track activity
+        api_client.update_job(local_job_id, {"status": local_status})
+        
+        logger.info(
+            f"Job {fireant_job_id} for report '{report_name}' status: {fireant_status} "
+            f"(attempt {attempt + 1}/{MAX_POLL_ATTEMPTS})"
+        )
+
+        if fireant_status == "Finished":
+            logger.info(f"Job {fireant_job_id} completed successfully")
             return {
-                "external_job_id": external_job_id,
+                "fireant_job_id": fireant_job_id,
                 "local_job_id": local_job_id,
-                "final_status": status,
+                "final_status": "completed",
                 "status_response": status_response,
             }
+        elif fireant_status == "Failed":
+            error_msg = f"Job {fireant_job_id} failed: {status_response.get('data', {}).get('error', 'Unknown error')}"
+            logger.error(error_msg)
+            return {
+                "fireant_job_id": fireant_job_id,
+                "local_job_id": local_job_id,
+                "final_status": "failed",
+                "status_response": status_response,
+                "error": error_msg,
+            }
 
-        logger.info(
-            f"Job {external_job_id} still running (attempt {attempt + 1})")
-        time.sleep(config.poll_interval_seconds)
+        time.sleep(POLL_INTERVAL_SECONDS)
 
-    # Timeout
+    # Timeout after max attempts
+    timeout_msg = f"Job {fireant_job_id} timed out after {MAX_POLL_ATTEMPTS} attempts"
+    logger.error(timeout_msg)
     api_client.update_job(local_job_id, {"status": "timeout"})
-    raise Exception(
-        f"Job {external_job_id} timed out after {
-            config.max_poll_attempts} attempts"
-    )
+    raise Exception(timeout_msg)
 
 
 @asset(group_name="processing", compute_kind="storage", deps=[job_completion_status])
@@ -137,10 +265,10 @@ def results_storage(
     context: OpExecutionContext,
     config: ReportProcessingConfig,
     api_client: DjangoAPIClient,
-    azure_storage: AzureStorageResource,
+    fabric_storage: FabricStorageResource,
     job_completion_status: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Download results and save to Azure lakehouse"""
+    """Download results and save to Fabric lakehouse"""
     logger = get_dagster_logger()
 
     if job_completion_status["final_status"] != "completed":
@@ -148,35 +276,60 @@ def results_storage(
             f"Job failed with status: {job_completion_status['final_status']}"
         )
 
-    external_client = ExternalAPIClient(
-        config.external_api_url, config.external_api_key
+    # Get metadata from upstream assets
+    job_output = context.asset_output_for_input("job_completion_status")
+    if not job_output or not job_output.metadata:
+        raise ValueError("Missing metadata from job_completion_status asset")
+
+    report_name = job_output.metadata.get("report_name", "Unknown")
+    fireant_job_id = job_completion_status["fireant_job_id"]
+    local_job_id = job_completion_status["local_job_id"]
+
+    # Initialize Fireant client
+    fireant_client = FireantAPIClient(
+        config.fireant_api_url, config.fireant_api_key
     )
 
-    # Download results
-    results_data = external_client.download_results(
-        job_completion_status["external_job_id"]
-    )
+    # Download results as JSON
+    logger.info(f"Downloading results for job {fireant_job_id}")
+    results_response = fireant_client.download_results(fireant_job_id)
+    results_data = results_response.json()
 
-    # Generate blob name
-    blob_name = f"reports/{config.report_id}/results_{
-        job_completion_status['external_job_id']}.json"
+    # Generate file name with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_name = f"report_{config.report_id}_{fireant_job_id}_{timestamp}.json"
 
-    # Upload to Azure
-    blob_url = azure_storage.upload_file(results_data, blob_name)
+    # Upload to Fabric lakehouse
+    logger.info(f"Uploading results to Fabric lakehouse: {file_name}")
+    file_path = fabric_storage.upload_json(results_data, file_name)
 
-    # Update local job with completion status
+    # Update local job with completion status and results location
     api_client.update_job(
-        job_completion_status["local_job_id"],
+        local_job_id,
         {
             "status": "completed",
-            "results_url": blob_url,  # Add this field to your Job model
+            "results_url": file_path,
         },
     )
 
-    logger.info(f"Results saved to: {blob_url}")
+    logger.info(
+        f"Results for report '{report_name}' (job {fireant_job_id}) "
+        f"saved to Fabric lakehouse: {file_path}"
+    )
+
+    # Add metadata for downstream assets
+    context.add_output_metadata({
+        "report_id": config.report_id,
+        "report_name": report_name,
+        "fireant_job_id": fireant_job_id,
+        "local_job_id": local_job_id,
+        "results_file": file_name,
+        "results_path": file_path,
+        "storage_time": datetime.now().isoformat(),
+    })
 
     return {
-        "blob_url": blob_url,
-        "blob_name": blob_name,
-        "job_id": job_completion_status["local_job_id"],
+        "file_path": file_path,
+        "file_name": file_name,
+        "job_id": local_job_id,
     }

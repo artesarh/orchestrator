@@ -23,22 +23,20 @@ report_partitions = DynamicPartitionsDefinition(name="reports")
 
 @job(
     partitions_def=report_partitions,
-    config={
-        "ops": {
-            "report_data": {
-                "config": {
-                    "report_id": {"env": "DAGSTER_REPORT_ID"},
-                    "modifier_id": {"env": "DAGSTER_MODIFIER_ID"},
-                    "external_api_url": {"env": "EXTERNAL_API_URL"},
-                    "external_api_key": {"env": "EXTERNAL_API_KEY"},
-                }
-            }
-        }
-    },
 )
 def process_report_job():
     """Process a single report through the complete pipeline"""
-    results_storage(
-        job_completion_status(local_job_record(
-            external_job_submission(report_data())))
-    )
+    # Step 1: Fetch and transform report data
+    data = report_data()
+    
+    # Step 2: Submit job to external API
+    submission = external_job_submission(data)
+    
+    # Step 3: Create local job record
+    job_record = local_job_record(submission)
+    
+    # Step 4: Poll for job completion
+    completion_status = job_completion_status(job_record)
+    
+    # Step 5: Store results
+    results_storage(completion_status)

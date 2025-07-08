@@ -1,0 +1,12 @@
+---
+- hosts: all
+  vars_files:
+    - ../secrets/secrets.yml
+  tasks:
+    - name: Create .env file
+      ansible.builtin.copy:
+        content: |
+          DB_PASSWORD={{ env_vars.db_password }}
+        dest: .env
+        mode: "0600"
+      no_log: true

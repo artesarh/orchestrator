@@ -1,35 +1,26 @@
-from dagster import (
-    sensor,
-    RunRequest,
-    SkipReason,
-    SensorEvaluationContext,
-    DefaultSensorStatus,
-    SensorResult,
-    AssetKey,
-    EventRecordsFilter,
-    DagsterEventType,
-)
+from dagster import schedule, RunRequest, SkipReason, DefaultScheduleStatus, AssetKey, EventRecordsFilter, DagsterEventType
+from ..jobs.report_pipeline import process_report_job
+from ..utils.config import CONFIG
 from croniter import croniter
 from datetime import datetime, timedelta
-from ..jobs.report_pipeline import process_report_job
-from ..assets.report_discovery import report_cron_schedules
-from ..utils.config import CONFIG
 
 
-@sensor(
-    asset_selection=[report_cron_schedules],
-    default_status=DefaultSensorStatus.RUNNING,
-    minimum_interval_seconds=int(CONFIG["CRON_SENSOR_INTERVAL_SECONDS"]),
+@schedule(
+    job=process_report_job,
+    cron_schedule=CONFIG["SCHEDULE_CRON_EXPRESSION"].split('#')[0].strip(),  # Clean cron expression, remove comments
+    default_status=DefaultScheduleStatus.RUNNING,
+    name="unified_report_schedule",
+    description="Unified schedule that checks all reports and runs those due now"
 )
-def report_cron_sensor(context: SensorEvaluationContext):
+def unified_report_schedule(context):
     """
-    Asset-based sensor that triggers jobs based on cron schedules.
-    Reads from report_cron_schedules asset that gets updated daily.
+    Single schedule that reads from report_cron_schedules asset and 
+    determines which reports need to run at the current time
     """
     logger = context.log
     
     try:
-        # Get the latest report schedules from the materialized asset
+        # Get the latest report schedules from the asset
         asset_key = AssetKey(["report_cron_schedules"])
         
         events = context.instance.get_event_records(
@@ -63,19 +54,22 @@ def report_cron_sensor(context: SensorEvaluationContext):
         current_time = datetime.now()
         run_requests = []
         
-        # Get sensor interval for timing window
-        timing_window = timedelta(seconds=int(CONFIG["CRON_SENSOR_INTERVAL_SECONDS"]))
-
-        for report_id, schedule_info in cron_schedules.items():
+        # Get configurable timing window for checking reports
+        timing_window = timedelta(seconds=int(CONFIG["SCHEDULE_INTERVAL_SECONDS"]))
+        
+        # Check each report's cron to see if it should run now
+        for report_id_str, schedule_info in cron_schedules.items():
+            report_id = int(report_id_str)
             cron_expr = schedule_info["cron"]
+            report_name = schedule_info["name"]
 
-            # Check if this report should run within the current timing window
+            # Check if this report should run within the configured timing window
             cron = croniter(cron_expr, current_time - timing_window)
             next_run = cron.get_next(datetime)
 
             if next_run <= current_time:
-                # Use the actual cron-determined run date
-                cron_run_date = next_run.date()
+                # This report should run now
+                run_date = next_run.date()
                 
                 # Create partition key with precise timing
                 partition_key = f"report_{report_id}_{int(next_run.timestamp())}"
@@ -83,8 +77,8 @@ def report_cron_sensor(context: SensorEvaluationContext):
                 # Add partition if it doesn't exist
                 context.instance.add_dynamic_partitions("reports", [partition_key])
                 
-                logger.info(f"Scheduling report {report_id} ('{schedule_info.get('name', 'Unnamed')}') "
-                           f"for cron date {cron_run_date} (partition {partition_key})")
+                logger.info(f"Scheduling report {report_id} ('{report_name}') "
+                           f"for scheduled time {next_run} (partition {partition_key})")
 
                 run_requests.append(
                     RunRequest(
@@ -93,8 +87,8 @@ def report_cron_sensor(context: SensorEvaluationContext):
                             "ops": {
                                 "report_data": {
                                     "config": {
-                                        "report_id": int(report_id),
-                                        "run_date": cron_run_date.isoformat(),
+                                        "report_id": report_id,
+                                        "run_date": run_date.isoformat(),
                                         "fireant_api_url": CONFIG["FIREANT_API_URL"],
                                         "fireant_api_key": CONFIG["FIREANT_API_KEY"],
                                     }
@@ -102,12 +96,10 @@ def report_cron_sensor(context: SensorEvaluationContext):
                             }
                         },
                         tags={
-                            "report_id": report_id,
-                            "report_name": schedule_info.get(
-                                "name", f"Report {report_id}"
-                            ),
+                            "report_id": str(report_id),
+                            "report_name": report_name,
                             "cron_schedule": cron_expr,
-                            "cron_run_date": cron_run_date.isoformat(),
+                            "scheduled_date": run_date.isoformat(),
                             "scheduled_time": next_run.isoformat(),
                         },
                     )
@@ -115,20 +107,10 @@ def report_cron_sensor(context: SensorEvaluationContext):
 
         if run_requests:
             logger.info(f"Triggering {len(run_requests)} report runs")
-        
-        return SensorResult(run_requests=run_requests)
+            return run_requests
+        else:
+            return SkipReason("No reports due to run at this time")
 
     except Exception as e:
-        logger.error(f"Error in cron sensor: {str(e)}")
-        return SkipReason(f"Error in sensor: {str(e)}")
-
-
-@sensor(
-    asset_selection=[report_cron_schedules],
-    default_status=DefaultSensorStatus.RUNNING,
-    minimum_interval_seconds=int(CONFIG["DISCOVERY_SENSOR_INTERVAL_SECONDS"]),
-)
-def daily_report_discovery_sensor(context: SensorEvaluationContext):
-    """Trigger report discovery at configurable interval"""
-    context.log.info("Triggering report discovery")
-    return RunRequest()
+        logger.error(f"Error in unified schedule: {str(e)}")
+        return SkipReason(f"Error in schedule: {str(e)}") 
